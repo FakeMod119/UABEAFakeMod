@@ -795,71 +795,78 @@ namespace UABEAvalonia
             }
         }
 
+        /// <summary>
+        /// UABEvol importer shared by the single- and multi-object RAW/Dump buttons.
+        /// Failures do not change the selected asset; later batch items still run.
+        /// </summary>
+        private async Task RunUABEvolBatchImport(
+            List<ImportBatchInfo> items, UABEvolAssetImportSourceFormat format)
+        {
+            int successful = 0;
+            var failures = new List<string>();
+            var warnings = new List<string>();
+            foreach (ImportBatchInfo item in items)
+            {
+                if (UABEvolImportBridge.TryImport(Workspace, item.cont, item.importFile, format,
+                    out string result))
+                {
+                    successful++;
+                    if (result.Contains("NOT verified", StringComparison.OrdinalIgnoreCase))
+                        warnings.Add($"{item.pathId}: {result}");
+                }
+                else
+                {
+                    failures.Add($"{item.assetFile} / {item.pathId}: {result}");
+                }
+            }
+
+            if (failures.Count > 0 || warnings.Count > 0)
+            {
+                const int maxShown = 10;
+                string details = string.Join("\n", failures.Take(maxShown));
+                if (failures.Count > maxShown)
+                    details += $"\n... and {failures.Count - maxShown} more failures.";
+                if (warnings.Count > 0)
+                    details += "\n\nUnverified RAW fallback:\n" + string.Join("\n", warnings.Take(maxShown));
+                await MessageBoxUtil.ShowDialog(this, "UABEvol import results",
+                    $"Imported: {successful}/{items.Count}; failed: {failures.Count}.\n\n{details}");
+            }
+        }
+
         private async Task BatchImportRaw(List<AssetContainer> selection)
         {
             var selectedFolders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions()
             {
                 Title = "Select import directory"
             });
-
-            string[] selectedFolderPaths = FileDialogUtils.GetOpenFolderDialogFiles(selectedFolders);
-            if (selectedFolderPaths.Length == 0)
-                return;
-
-            string dir = selectedFolderPaths[0];
-
-            List<string> extensions = new List<string>() { "dat" };
-
-            ImportBatch dialog = new ImportBatch(Workspace, selection, dir, extensions);
-            List<ImportBatchInfo> batchInfos = await dialog.ShowDialog<List<ImportBatchInfo>>(this);
-            if (batchInfos != null)
-            {
-                foreach (ImportBatchInfo batchInfo in batchInfos)
-                {
-                    string selectedFilePath = batchInfo.importFile;
-                    AssetContainer selectedCont = batchInfo.cont;
-                    AssetsFileInstance selectedInst = selectedCont.FileInstance;
-
-                    using (FileStream fs = File.OpenRead(selectedFilePath))
-                    {
-                        AssetImportExport importer = new AssetImportExport();
-                        byte[] bytes = importer.ImportRawAsset(fs);
-
-                        AssetsReplacer replacer = AssetImportExport.CreateAssetReplacer(selectedCont, bytes);
-                        Workspace.AddReplacer(selectedInst, replacer, new MemoryStream(bytes));
-                    }
-                }
-            }
+            string[] paths = FileDialogUtils.GetOpenFolderDialogFiles(selectedFolders);
+            if (paths.Length == 0) return;
+            ImportBatch dialog = new ImportBatch(Workspace, selection, paths[0], new List<string> { "dat", "bin", "raw" });
+            List<ImportBatchInfo>? items = await dialog.ShowDialog<List<ImportBatchInfo>>(this);
+            if (items != null && items.Count > 0)
+                await RunUABEvolBatchImport(items, UABEvolAssetImportSourceFormat.Raw);
         }
 
         private async Task SingleImportRaw(List<AssetContainer> selection)
         {
-            AssetContainer selectedCont = selection[0];
-            AssetsFileInstance selectedInst = selectedCont.FileInstance;
-
             var selectedFiles = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions()
             {
                 Title = "Open",
                 FileTypeFilter = new List<FilePickerFileType>()
                 {
-                    new FilePickerFileType("Raw Unity Asset") { Patterns = new List<string>() { "*.dat" } }
+                    new FilePickerFileType("Raw Unity Asset")
+                    {
+                        Patterns = new List<string>() { "*.dat", "*.bin", "*.raw" }
+                    }
                 }
             });
-
-            string[] selectedFilePaths = FileDialogUtils.GetOpenFileDialogFiles(selectedFiles);
-            if (selectedFilePaths.Length == 0)
-                return;
-
-            string file = selectedFilePaths[0];
-
-            using (FileStream fs = File.OpenRead(file))
-            {
-                AssetImportExport importer = new AssetImportExport();
-                byte[] bytes = importer.ImportRawAsset(fs);
-
-                AssetsReplacer replacer = AssetImportExport.CreateAssetReplacer(selectedCont, bytes);
-                Workspace.AddReplacer(selectedInst, replacer, new MemoryStream(bytes));
-            }
+            string[] paths = FileDialogUtils.GetOpenFileDialogFiles(selectedFiles);
+            if (paths.Length == 0) return;
+            if (!UABEvolImportBridge.TryImport(Workspace, selection[0], paths[0],
+                UABEvolAssetImportSourceFormat.Raw, out string result))
+                await MessageBoxUtil.ShowDialog(this, "UABEvol RAW import error", result);
+            else if (result.Contains("NOT verified", StringComparison.OrdinalIgnoreCase))
+                await MessageBoxUtil.ShowDialog(this, "UABEvol RAW import warning", result);
         }
 
         private async Task BatchImportDump(List<AssetContainer> selection)
@@ -868,113 +875,58 @@ namespace UABEAvalonia
             {
                 Title = "Select import directory"
             });
-
-            string[] selectedFolderPaths = FileDialogUtils.GetOpenFolderDialogFiles(selectedFolders);
-            if (selectedFolderPaths.Length == 0)
-                return;
-
-            string dir = selectedFolderPaths[0];
+            string[] paths = FileDialogUtils.GetOpenFolderDialogFiles(selectedFolders);
+            if (paths.Length == 0) return;
 
             SelectDumpWindow selectDumpWindow = new SelectDumpWindow(false);
             string? extension = await selectDumpWindow.ShowDialog<string?>(this);
+            if (extension == null) return;
 
-            if (extension == null)
-                return;
+            List<string> extensions = extension == "any"
+                ? SelectDumpWindow.ALL_EXTENSIONS
+                : new List<string> { extension };
+            ImportBatch dialog = new ImportBatch(Workspace, selection, paths[0], extensions);
+            List<ImportBatchInfo>? items = await dialog.ShowDialog<List<ImportBatchInfo>>(this);
+            if (items == null || items.Count == 0) return;
 
-            List<string> extensions;
-            if (extension == "any")
-                extensions = SelectDumpWindow.ALL_EXTENSIONS;
-            else
-                extensions = new List<string>() { extension };
-
-            ImportBatch dialog = new ImportBatch(Workspace, selection, dir, extensions);
-            List<ImportBatchInfo> batchInfos = await dialog.ShowDialog<List<ImportBatchInfo>>(this);
-            if (batchInfos != null)
+            // A mixed txt/json batch can have different formats per asset.
+            int successful = 0;
+            var failures = new List<string>();
+            foreach (ImportBatchInfo item in items)
             {
-                foreach (ImportBatchInfo batchInfo in batchInfos)
-                {
-                    string selectedFilePath = batchInfo.importFile;
-                    AssetContainer selectedCont = batchInfo.cont;
-                    AssetsFileInstance selectedInst = selectedCont.FileInstance;
-
-                    using (FileStream fs = File.OpenRead(selectedFilePath))
-                    using (StreamReader sr = new StreamReader(fs))
-                    {
-                        AssetImportExport importer = new AssetImportExport();
-
-                        byte[]? bytes;
-                        string? exceptionMessage;
-
-                        if (selectedFilePath.EndsWith(".json"))
-                        {
-                            AssetTypeTemplateField tempField = Workspace.GetTemplateField(selectedCont);
-                            bytes = importer.ImportJsonAsset(tempField, sr, out exceptionMessage);
-                        }
-                        else
-                        {
-                            bytes = importer.ImportTextAsset(sr, out exceptionMessage);
-                        }
-
-                        if (bytes == null)
-                        {
-                            await MessageBoxUtil.ShowDialog(this, "Parse error", "Something went wrong when reading the dump file:\n" + exceptionMessage);
-                            return;
-                        }
-
-                        AssetsReplacer replacer = AssetImportExport.CreateAssetReplacer(selectedCont, bytes);
-                        Workspace.AddReplacer(selectedInst, replacer, new MemoryStream(bytes));
-                    }
-                }
+                UABEvolAssetImportSourceFormat format = Path.GetExtension(item.importFile)
+                    .Equals(".json", StringComparison.OrdinalIgnoreCase)
+                    ? UABEvolAssetImportSourceFormat.Json : UABEvolAssetImportSourceFormat.Text;
+                if (UABEvolImportBridge.TryImport(Workspace, item.cont, item.importFile, format, out string result))
+                    successful++;
+                else
+                    failures.Add($"{item.assetFile} / {item.pathId}: {result}");
             }
+            if (failures.Count > 0)
+                await MessageBoxUtil.ShowDialog(this, "UABEvol dump import results",
+                    $"Imported: {successful}/{items.Count}; failed: {failures.Count}.\n\n" +
+                    string.Join("\n", failures.Take(10)));
         }
 
         private async Task SingleImportDump(List<AssetContainer> selection)
         {
-            AssetContainer selectedCont = selection[0];
-            AssetsFileInstance selectedInst = selectedCont.FileInstance;
-
             var selectedFiles = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions()
             {
                 Title = "Open",
                 FileTypeFilter = new List<FilePickerFileType>()
                 {
                     new FilePickerFileType("UABE text dump") { Patterns = new List<string>() { "*.txt" } },
-                    new FilePickerFileType("UABEA json dump") { Patterns = new List<string>() { "*.json" } }
+                    new FilePickerFileType("UABEA JSON dump") { Patterns = new List<string>() { "*.json" } }
                 }
             });
-
-            string[] selectedFilePaths = FileDialogUtils.GetOpenFileDialogFiles(selectedFiles);
-            if (selectedFilePaths.Length == 0)
-                return;
-
-            string file = selectedFilePaths[0];
-
-            using (FileStream fs = File.OpenRead(file))
-            using (StreamReader sr = new StreamReader(fs))
-            {
-                AssetImportExport importer = new AssetImportExport();
-
-                byte[]? bytes = null;
-                string? exceptionMessage = null;
-                if (file.EndsWith(".json"))
-                {
-                    AssetTypeTemplateField tempField = Workspace.GetTemplateField(selectedCont);
-                    bytes = importer.ImportJsonAsset(tempField, sr, out exceptionMessage);
-                }
-                else
-                {
-                    bytes = importer.ImportTextAsset(sr, out exceptionMessage);
-                }
-
-                if (bytes == null)
-                {
-                    await MessageBoxUtil.ShowDialog(this, "Parse error", "Something went wrong when reading the dump file:\n" + exceptionMessage);
-                    return;
-                }
-
-                AssetsReplacer replacer = AssetImportExport.CreateAssetReplacer(selectedCont, bytes);
-                Workspace.AddReplacer(selectedInst, replacer, new MemoryStream(bytes));
-            }
+            string[] paths = FileDialogUtils.GetOpenFileDialogFiles(selectedFiles);
+            if (paths.Length == 0) return;
+            UABEvolAssetImportSourceFormat format = Path.GetExtension(paths[0])
+                .Equals(".json", StringComparison.OrdinalIgnoreCase)
+                ? UABEvolAssetImportSourceFormat.Json : UABEvolAssetImportSourceFormat.Text;
+            if (!UABEvolImportBridge.TryImport(Workspace, selection[0], paths[0], format,
+                out string result))
+                await MessageBoxUtil.ShowDialog(this, "UABEvol dump import error", result);
         }
 
         public async Task<bool> ShowEditAssetWindow(AssetContainer cont)
