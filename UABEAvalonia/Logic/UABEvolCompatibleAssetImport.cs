@@ -9,6 +9,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace UABEAvalonia;
 
@@ -78,6 +79,7 @@ public sealed class UABEvolCompatibleAssetImporter
     private readonly AssetsManager? _manager;
     private readonly int _targetTypeId;
     private readonly bool _preferEditorTemplate;
+    private readonly CancellationToken _cancellationToken;
 
     // RAW exporters in the wild sometimes append a small, all-zero terminal block
     // after a MonoBehaviour object (the user's UMA Mesh sample has 16 bytes).
@@ -100,7 +102,8 @@ public sealed class UABEvolCompatibleAssetImporter
         bool targetBigEndian,
         AssetsManager? manager = null,
         int targetTypeId = 0,
-        bool preferEditorTemplate = false)
+        bool preferEditorTemplate = false,
+        CancellationToken cancellationToken = default)
     {
         _sourceData = sourceData ?? throw new ArgumentNullException(nameof(sourceData));
         _refMan = refMan;
@@ -108,6 +111,7 @@ public sealed class UABEvolCompatibleAssetImporter
         _manager = manager;
         _targetTypeId = targetTypeId;
         _preferEditorTemplate = preferEditorTemplate;
+        _cancellationToken = cancellationToken;
     }
 
     public byte[]? Import(
@@ -120,6 +124,7 @@ public sealed class UABEvolCompatibleAssetImporter
         exceptionMessage = null;
         try
         {
+            _cancellationToken.ThrowIfCancellationRequested();
             switch (format)
             {
                 case UABEvolAssetImportSourceFormat.Json:
@@ -241,6 +246,11 @@ public sealed class UABEvolCompatibleAssetImporter
             return (byte[])_sourceData.Clone();
         }
 
+        // RAW/DAT/BIN has no node names or Unity version metadata. The target
+        // template is tried first; if its byte-exact round-trip succeeds, prefer it
+        // instead of rescanning every Unity class database for the same asset.
+        // Raw compatibility with genuinely different schemas still requires a dump.
+        //
         // RAW/DAT/BIN has no node names or Unity version metadata. Resolve it only
         // when exactly one distinct TypeTree layout can parse the payload. If more
         // than one historical layout fits, choosing one would be guessing and could
@@ -355,7 +365,9 @@ public sealed class UABEvolCompatibleAssetImporter
     {
         recovered = null;
         zeroBytesDropped = 0;
-        if (_sourceData.Length < 128 || _targetBigEndian)
+        // This UMA-specific repair allocates one new candidate buffer per offset.
+        // Refuse huge objects rather than repeatedly copying megabytes of bytes.
+        if (_sourceData.Length < 128 || _sourceData.Length > 2 * 1024 * 1024 || _targetBigEndian)
             return false;
 
         AssetTypeValueField meshData = targetBaseField["meshData"];
@@ -399,6 +411,7 @@ public sealed class UABEvolCompatibleAssetImporter
 
         for (long p = scanStart; p + extraZeroBytes <= consumed; p += 4)
         {
+            _cancellationToken.ThrowIfCancellationRequested();
             int start = checked((int)p);
             bool allZero = true;
             for (int j = 0; j < extraZeroBytes; j++)
@@ -460,6 +473,14 @@ public sealed class UABEvolCompatibleAssetImporter
         return true;
     }
 
+    private static bool HasOnlyZeroTail(byte[] raw, int start)
+    {
+        for (int index = start; index < raw.Length; index++)
+            if (raw[index] != 0)
+                return false;
+        return true;
+    }
+
     private static AssetTypeValueField CreateFreshTarget(AssetTypeValueField targetBaseField)
     {
         // Never clone the current values here. Cross-version import is a VALUE
@@ -503,7 +524,53 @@ public sealed class UABEvolCompatibleAssetImporter
         }
 
         if (targetParsedOk && targetParsed != null)
+        {
+            // A full deserialize alone is weak evidence (different primitive
+            // layouts can have the same size). Require an exact binary round trip.
+            // Shader additionally must have a coherent program/blob layout.
+            bool roundTripMatches = false;
+            try
+            {
+                byte[] encoded = targetParsed.WriteToByteArray(_targetBigEndian);
+                roundTripMatches = encoded.Length <= _sourceData.Length &&
+                    encoded.AsSpan().SequenceEqual(_sourceData.AsSpan(0, encoded.Length)) &&
+                    HasOnlyZeroTail(_sourceData, encoded.Length) &&
+                    _sourceData.Length - encoded.Length <=
+                        (IsMonoBehaviourTarget ? MonoBehaviourRawTerminalZeroTolerance : 7);
+            }
+            catch
+            {
+                // A partial/truncated deserialize is never a verified match.
+            }
+
+            if (roundTripMatches)
+            {
+                if (_targetTypeId != (int)AssetClassID.Shader)
+                {
+                    sourceField = targetParsed;
+                    sourceUsesTargetTemplate = true;
+                    candidateCount = 1;
+                    return true;
+                }
+                if (ValidateShaderProgramLayout(targetParsed, out _, out _))
+                {
+                    return TryResolveShaderRawSourceField(
+                        targetBaseField,
+                        new List<(AssetTypeValueField Field, bool IsTarget)> { (targetParsed, true) },
+                        out sourceField, out sourceUsesTargetTemplate, out candidateCount);
+                }
+            }
             candidates[targetSignature] = (targetParsed, true);
+        }
+
+        // Trying every historical Unity schema on an untyped multi-megabyte RAW
+        // can allocate gigabytes and make the application appear hung. Large RAW
+        // needs matching source TypeTree metadata for safe migration.
+        if (_sourceData.Length > 2 * 1024 * 1024)
+            throw new InvalidDataException(
+                "RAW is too large for brute-force historical TypeTree discovery " +
+                "and did not pass destination round-trip validation. " +
+                "Use a matching TXT/JSON dump or the original source TypeTree.");
 
         ClassPackageFile? package = _manager?.ClassPackage;
         if (package?.TpkTypeTree?.ClassInformation != null)
@@ -517,8 +584,15 @@ public sealed class UABEvolCompatibleAssetImporter
 
             if (classInfo != null)
             {
+                int probedLayouts = 0;
                 foreach (var versionEntry in classInfo.Classes)
                 {
+                    _cancellationToken.ThrowIfCancellationRequested();
+                    if (++probedLayouts > 48)
+                        throw new InvalidDataException(
+                            "RAW has no source Unity version metadata. Historical scan reached its " +
+                            "48-schema safety budget without a unique answer. " +
+                            "Use a matching TXT/JSON dump for cross-version imports.");
                     if (versionEntry.Value == null)
                         continue;
 
