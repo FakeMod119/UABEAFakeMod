@@ -77,6 +77,20 @@ public static class UABEvolImportBridge
                 return new UABEvolPreparedImport(source, note + $" Prepared in {timer.ElapsedMilliseconds} ms.");
             }
 
+            // R4: Material and UMA *_Mesh RAW are handled before GetBaseField.
+            // GetBaseField and unrelated historical TypeTree probes can try to
+            // deserialize enormous arrays from a mismatched schema, freezing UABEA.
+            // Fast paths are bounded header checks + byte replacement, with
+            // destination m_Shader/m_Script pointers protected and an explicit
+            // NOT verified warning. Other classes keep the R3 typed importer.
+            if (raw && UABEvolRawKnownAssetImport.TryPrepare(
+                    destination, source, out byte[]? knownRaw, out string knownDiagnostic))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return new UABEvolPreparedImport(knownRaw,
+                    knownDiagnostic + $" Prepared in {timer.ElapsedMilliseconds} ms.");
+            }
+
             AssetTypeValueField? target = workspace.GetBaseField(destination);
             if (target == null)
             {
