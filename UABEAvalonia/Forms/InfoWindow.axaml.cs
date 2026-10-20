@@ -796,6 +796,50 @@ namespace UABEAvalonia
         }
 
         /// <summary>
+        /// Reading/parsing/converting must run OFF the UI thread. AddReplacer
+        /// raises DataGrid events, so commit is performed on the UI thread only.
+        /// A modal busy dialog prevents concurrent Save/edit using shared readers,
+        /// shows progress, and lets the user cancel safely before commit.
+        /// </summary>
+        private async Task<(bool Success, string Diagnostic)> ImportOneAsync(
+            AssetContainer destination, string sourcePath,
+            UABEvolAssetImportSourceFormat format, string progress,
+            UABEvolImportProgressWindow? dialog = null)
+        {
+            bool ownsDialog = dialog == null;
+            dialog ??= new UABEvolImportProgressWindow();
+            Task? modalTask = null;
+            try
+            {
+                dialog.SetStatus($"Import {progress}: {Path.GetFileName(sourcePath)}");
+                if (ownsDialog)
+                    modalTask = dialog.ShowDialog(this);
+
+                UABEvolPreparedImport prepared = await Task.Run(() =>
+                    UABEvolImportBridge.Prepare(Workspace, destination, sourcePath,
+                        format, dialog.Cancellation.Token));
+                if (dialog.Cancellation.IsCancellationRequested)
+                    return (false, "Import canceled; destination asset unchanged.");
+                bool committed = UABEvolImportBridge.TryCommit(
+                    Workspace, destination, prepared, out string result);
+                return (committed, result);
+            }
+            catch (Exception ex)
+            {
+                return (false, ex.ToString());
+            }
+            finally
+            {
+                if (ownsDialog)
+                {
+                    dialog.Finish();
+                    if (modalTask != null)
+                        await modalTask;
+                }
+            }
+        }
+
+        /// <summary>
         /// UABEvol importer shared by the single- and multi-object RAW/Dump buttons.
         /// Failures do not change the selected asset; later batch items still run.
         /// </summary>
@@ -805,22 +849,36 @@ namespace UABEAvalonia
             int successful = 0;
             var failures = new List<string>();
             var warnings = new List<string>();
-            foreach (ImportBatchInfo item in items)
+            var progress = new UABEvolImportProgressWindow();
+            Task modalTask = progress.ShowDialog(this);
+            try
             {
-                if (UABEvolImportBridge.TryImport(Workspace, item.cont, item.importFile, format,
-                    out string result))
+                for (int index = 0; index < items.Count; index++)
                 {
-                    successful++;
-                    if (result.Contains("NOT verified", StringComparison.OrdinalIgnoreCase))
-                        warnings.Add($"{item.pathId}: {result}");
-                }
-                else
-                {
-                    failures.Add($"{item.assetFile} / {item.pathId}: {result}");
+                    if (progress.Cancellation.IsCancellationRequested)
+                        break;
+                    ImportBatchInfo item = items[index];
+                    var (success, result) = await ImportOneAsync(
+                        item.cont, item.importFile, format, $"{index + 1}/{items.Count}", progress);
+                    if (success)
+                    {
+                        successful++;
+                        if (result.Contains("NOT verified", StringComparison.OrdinalIgnoreCase))
+                            warnings.Add($"{item.pathId}: {result}");
+                    }
+                    else
+                    {
+                        failures.Add($"{item.assetFile} / {item.pathId}: {result}");
+                    }
                 }
             }
+            finally
+            {
+                progress.Finish();
+                await modalTask;
+            }
 
-            if (failures.Count > 0 || warnings.Count > 0)
+            if (failures.Count > 0 || warnings.Count > 0 || progress.Cancellation.IsCancellationRequested)
             {
                 const int maxShown = 10;
                 string details = string.Join("\n", failures.Take(maxShown));
@@ -829,7 +887,9 @@ namespace UABEAvalonia
                 if (warnings.Count > 0)
                     details += "\n\nUnverified RAW fallback:\n" + string.Join("\n", warnings.Take(maxShown));
                 await MessageBoxUtil.ShowDialog(this, "UABEvol import results",
-                    $"Imported: {successful}/{items.Count}; failed: {failures.Count}.\n\n{details}");
+                    $"Imported: {successful}/{items.Count}; failed: {failures.Count}." +
+                    (progress.Cancellation.IsCancellationRequested ? " Import canceled." : "") +
+                    $"\n\n{details}");
             }
         }
 
@@ -862,8 +922,9 @@ namespace UABEAvalonia
             });
             string[] paths = FileDialogUtils.GetOpenFileDialogFiles(selectedFiles);
             if (paths.Length == 0) return;
-            if (!UABEvolImportBridge.TryImport(Workspace, selection[0], paths[0],
-                UABEvolAssetImportSourceFormat.Raw, out string result))
+            var (success, result) = await ImportOneAsync(selection[0], paths[0],
+                UABEvolAssetImportSourceFormat.Raw, "1/1");
+            if (!success)
                 await MessageBoxUtil.ShowDialog(this, "UABEvol RAW import error", result);
             else if (result.Contains("NOT verified", StringComparison.OrdinalIgnoreCase))
                 await MessageBoxUtil.ShowDialog(this, "UABEvol RAW import warning", result);
@@ -892,20 +953,36 @@ namespace UABEAvalonia
             // A mixed txt/json batch can have different formats per asset.
             int successful = 0;
             var failures = new List<string>();
-            foreach (ImportBatchInfo item in items)
+            var progress = new UABEvolImportProgressWindow();
+            Task modalTask = progress.ShowDialog(this);
+            try
             {
-                UABEvolAssetImportSourceFormat format = Path.GetExtension(item.importFile)
-                    .Equals(".json", StringComparison.OrdinalIgnoreCase)
-                    ? UABEvolAssetImportSourceFormat.Json : UABEvolAssetImportSourceFormat.Text;
-                if (UABEvolImportBridge.TryImport(Workspace, item.cont, item.importFile, format, out string result))
-                    successful++;
-                else
-                    failures.Add($"{item.assetFile} / {item.pathId}: {result}");
+                for (int index = 0; index < items.Count; index++)
+                {
+                    if (progress.Cancellation.IsCancellationRequested)
+                        break;
+                    ImportBatchInfo item = items[index];
+                    UABEvolAssetImportSourceFormat format = Path.GetExtension(item.importFile)
+                        .Equals(".json", StringComparison.OrdinalIgnoreCase)
+                        ? UABEvolAssetImportSourceFormat.Json : UABEvolAssetImportSourceFormat.Text;
+                    var (success, result) = await ImportOneAsync(
+                        item.cont, item.importFile, format, $"{index + 1}/{items.Count}", progress);
+                    if (success)
+                        successful++;
+                    else
+                        failures.Add($"{item.assetFile} / {item.pathId}: {result}");
+                }
             }
-            if (failures.Count > 0)
+            finally
+            {
+                progress.Finish();
+                await modalTask;
+            }
+            if (failures.Count > 0 || progress.Cancellation.IsCancellationRequested)
                 await MessageBoxUtil.ShowDialog(this, "UABEvol dump import results",
-                    $"Imported: {successful}/{items.Count}; failed: {failures.Count}.\n\n" +
-                    string.Join("\n", failures.Take(10)));
+                    $"Imported: {successful}/{items.Count}; failed: {failures.Count}." +
+                    (progress.Cancellation.IsCancellationRequested ? " Import canceled." : "") +
+                    "\n\n" + string.Join("\n", failures.Take(10)));
         }
 
         private async Task SingleImportDump(List<AssetContainer> selection)
@@ -924,8 +1001,9 @@ namespace UABEAvalonia
             UABEvolAssetImportSourceFormat format = Path.GetExtension(paths[0])
                 .Equals(".json", StringComparison.OrdinalIgnoreCase)
                 ? UABEvolAssetImportSourceFormat.Json : UABEvolAssetImportSourceFormat.Text;
-            if (!UABEvolImportBridge.TryImport(Workspace, selection[0], paths[0], format,
-                out string result))
+            var (success, result) = await ImportOneAsync(
+                selection[0], paths[0], format, "1/1");
+            if (!success)
                 await MessageBoxUtil.ShowDialog(this, "UABEvol dump import error", result);
         }
 
@@ -1216,13 +1294,18 @@ namespace UABEAvalonia
             }
         }
 
-        private async void Workspace_MonoTemplateLoadFailed(string path)
+        private void Workspace_MonoTemplateLoadFailed(string path)
         {
-            await MessageBoxUtil.ShowDialog(
-                this, "Error",
-                "MonoBehaviour template info failed to load.\n" +
-                "MonoBehaviour assets will not be fully deserialized.\n" +
-                $"Searched in {path}");
+            // The RAW import now deserializes on a worker; a missing Mono schema
+            // callback is raised there. Always open dialogs on Avalonia's UI thread.
+            Avalonia.Threading.Dispatcher.UIThread.Post(async () =>
+            {
+                await MessageBoxUtil.ShowDialog(
+                    this, "Error",
+                    "MonoBehaviour template info failed to load.\n" +
+                    "MonoBehaviour assets will not be fully deserialized.\n" +
+                    $"Searched in {path}");
+            });
         }
 
         // TEMPORARY DATAGRID HACKS
