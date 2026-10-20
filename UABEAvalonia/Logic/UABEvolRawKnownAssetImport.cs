@@ -1,4 +1,5 @@
 using AssetsTools.NET;
+using AssetsTools.NET.Extra;
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
