@@ -2107,7 +2107,13 @@ public sealed class UABEvolCompatibleAssetImporter
         {
             if (!string.Equals(root.Children[i].TemplateField?.Name, name, StringComparison.Ordinal))
                 continue;
-            root.Children[i] = replacement.Clone();
+            // AssetsTools.NET in UABEA exposes Clone() on AssetTypeTemplateField,
+            // not on AssetTypeValueField. The replacement comes exclusively from
+            // originalTarget, and after this method the merged tree is only read
+            // (shader validation / WriteToByteArray), never mutated. Reusing this
+            // immutable value subtree preserves the original m_Script PPtr and
+            // shader target-owned fields exactly, without a nonexistent Clone API.
+            root.Children[i] = replacement;
             return true;
         }
         return false;
